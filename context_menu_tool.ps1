@@ -158,13 +158,14 @@ function Set-RegistryStringValue {
         [string]$Name,
 
         [Parameter(Mandatory = $false)]
+        [AllowNull()]
         [AllowEmptyString()]
         [string]$Value
     )
 
     Ensure-RegistryKey -Path $Path
 
-    if ([string]::IsNullOrWhiteSpace($Value)) {
+    if ($null -eq $Value) {
         if ((Get-Item -LiteralPath $Path).Property -contains $Name) {
             Remove-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
         }
@@ -426,16 +427,19 @@ function Get-ContextMenuEntries {
                 $displayName = $child.PSChildName
             }
 
+            $isDisabled = ($item.Property -contains "LegacyDisable")
+
             $entries += [pscustomobject]@{
                     DisplayName  = $displayName
+                    ScopeId      = $root.ScopeId
                     Scope        = $root.ScopeLabel
                     Source       = $root.Source
-                    Status       = if ($null -ne $item.GetValue("LegacyDisable")) { "Disabled" } else { "Enabled" }
+                    Status       = if ($isDisabled) { "Disabled" } else { "Enabled" }
                     KeyName      = $child.PSChildName
                     RegistryPath = $entryPath
                     Command      = Get-InvocationSummary -EntryPath $entryPath
                     Icon         = $item.GetValue("Icon")
-                    IsDisabled   = ($null -ne $item.GetValue("LegacyDisable"))
+                    IsDisabled   = $isDisabled
                     IsCustomApp  = ($child.PSChildName -like "OpenWithCustomApp_*")
                 }
         }
@@ -448,6 +452,184 @@ function Test-IsAdministrator {
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Restart-ScriptAsAdministrator {
+    param(
+        [Parameter(Mandatory = $false)]
+        [string[]]$AdditionalArguments,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$HideWindow
+    )
+
+    $scriptPath = if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        $PSCommandPath
+    }
+    else {
+        $MyInvocation.MyCommand.Path
+    }
+
+    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+        throw "Could not determine the script path for elevation."
+    }
+
+    $argumentList = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        (Format-ProcessArgument -Value $scriptPath)
+    )
+
+    if ($null -ne $AdditionalArguments -and $AdditionalArguments.Count -gt 0) {
+        $argumentList += $AdditionalArguments
+    }
+
+    $startProcessParameters = @{
+        FilePath     = "powershell.exe"
+        ArgumentList = $argumentList
+        Verb         = "RunAs"
+        PassThru     = $true
+    }
+
+    if ($HideWindow) {
+        $startProcessParameters.WindowStyle = "Hidden"
+    }
+
+    $process = Start-Process @startProcessParameters
+    return ($null -ne $process)
+}
+
+function Format-ProcessArgument {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    if ($Value.IndexOfAny([char[]]@(' ', "`t", '"')) -lt 0) {
+        return $Value
+    }
+
+    return '"' + ($Value -replace '"', '\"') + '"'
+}
+
+function Convert-BoundParametersToArgumentList {
+    param(
+        [Parameter(Mandatory = $false)]
+        [System.Collections.IDictionary]$BoundParameters
+    )
+
+    if ($null -eq $BoundParameters -or $BoundParameters.Count -eq 0) {
+        return @()
+    }
+
+    $parameterOrder = @("AppPath", "Action", "Scopes", "Gui")
+    $argumentList = @()
+
+    foreach ($parameterName in $parameterOrder) {
+        if (-not $BoundParameters.ContainsKey($parameterName)) {
+            continue
+        }
+
+        $value = $BoundParameters[$parameterName]
+
+        if ($value -is [System.Management.Automation.SwitchParameter]) {
+            if ($value.IsPresent) {
+                $argumentList += "-$parameterName"
+            }
+
+            continue
+        }
+
+        if ($null -eq $value) {
+            continue
+        }
+
+        if ($value -is [System.Array]) {
+            if ($value.Count -eq 0) {
+                continue
+            }
+
+            $argumentList += "-$parameterName"
+            foreach ($item in $value) {
+                $argumentList += (Format-ProcessArgument -Value ([string]$item))
+            }
+
+            continue
+        }
+
+        $argumentList += "-$parameterName"
+        $argumentList += (Format-ProcessArgument -Value ([string]$value))
+    }
+
+    return $argumentList
+}
+
+function Ensure-AdministratorSession {
+    param(
+        [Parameter(Mandatory = $false)]
+        [System.Collections.IDictionary]$BoundParameters,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$HideWindow
+    )
+
+    if (Test-IsAdministrator) {
+        return $true
+    }
+
+    try {
+        $argumentList = Convert-BoundParametersToArgumentList -BoundParameters $BoundParameters
+        $started = Restart-ScriptAsAdministrator -AdditionalArguments $argumentList -HideWindow:$HideWindow
+
+        if ($started) {
+            # The elevated child process takes over from here.
+            return $false
+        }
+
+        return $false
+    }
+    catch [System.ComponentModel.Win32Exception] {
+        if ($_.Exception.NativeErrorCode -eq 1223) {
+            return $false
+        }
+
+        throw
+    }
+}
+
+function Set-ConsoleWindowVisibility {
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$Visible
+    )
+
+    if (-not ("ContextMenuEditor.ConsoleWindow" -as [type])) {
+        Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace ContextMenuEditor {
+    public static class ConsoleWindow {
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GetConsoleWindow();
+
+        [DllImport("user32.dll")]
+        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    }
+}
+"@
+    }
+
+    $consoleHandle = [ContextMenuEditor.ConsoleWindow]::GetConsoleWindow()
+    if ($consoleHandle -eq [IntPtr]::Zero) {
+        return
+    }
+
+    $showMode = if ($Visible) { 5 } else { 0 }
+    [ContextMenuEditor.ConsoleWindow]::ShowWindow($consoleHandle, $showMode) | Out-Null
 }
 
 function Write-EntryList {
@@ -477,11 +659,20 @@ function Show-ContextMenuManagerGui {
     $topInfoLabel = New-Object System.Windows.Forms.Label
     $topInfoLabel.Location = New-Object System.Drawing.Point(12, 12)
     $topInfoLabel.Size = New-Object System.Drawing.Size(1275, 42)
-    $topInfoLabel.Text = if (Test-IsAdministrator) {
-        "Manage existing shell-based context menu entries from a GUI. Both user and system entries are shown."
-    }
-    else {
-        "Manage existing shell-based context menu entries from a GUI. Editing system entries (HKLM) requires administrator rights."
+    $topInfoLabel.Text = "The editor runs with administrator rights. Use the tabs to browse each scope separately."
+
+    $tabDefinitions = @(
+        [pscustomobject]@{
+            Id    = "All"
+            Label = "All"
+        }
+    )
+
+    foreach ($scope in $script:ScopeCatalog) {
+        $tabDefinitions += [pscustomobject]@{
+            Id    = $scope.Id
+            Label = $scope.Label
+        }
     }
 
     $splitContainer = New-Object System.Windows.Forms.SplitContainer
@@ -516,22 +707,14 @@ function Show-ContextMenuManagerGui {
     $countLabel.Size = New-Object System.Drawing.Size(430, 20)
     $countLabel.Text = "0 items"
 
-    $entryListView = New-Object System.Windows.Forms.ListView
-    $entryListView.Location = New-Object System.Drawing.Point(8, 72)
-    $entryListView.Size = New-Object System.Drawing.Size(660, 596)
-    $entryListView.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor
+    $scopeTabControl = New-Object System.Windows.Forms.TabControl
+    $scopeTabControl.Location = New-Object System.Drawing.Point(8, 72)
+    $scopeTabControl.Size = New-Object System.Drawing.Size(660, 596)
+    $scopeTabControl.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor
         [System.Windows.Forms.AnchorStyles]::Bottom -bor
         [System.Windows.Forms.AnchorStyles]::Left -bor
         [System.Windows.Forms.AnchorStyles]::Right
-    $entryListView.FullRowSelect = $true
-    $entryListView.HideSelection = $false
-    $entryListView.MultiSelect = $false
-    $entryListView.View = [System.Windows.Forms.View]::Details
-    $null = $entryListView.Columns.Add("Display Name", 270)
-    $null = $entryListView.Columns.Add("Scope", 120)
-    $null = $entryListView.Columns.Add("Source", 90)
-    $null = $entryListView.Columns.Add("Status", 80)
-    $null = $entryListView.Columns.Add("Key Name", 200)
+    $scopeTabControl.Multiline = $true
 
     $detailsGroup = New-Object System.Windows.Forms.GroupBox
     $detailsGroup.Location = New-Object System.Drawing.Point(10, 8)
@@ -767,7 +950,7 @@ function Show-ContextMenuManagerGui {
             $filterTextBox,
             $refreshButton,
             $countLabel,
-            $entryListView
+            $scopeTabControl
         ))
     $splitContainer.Panel2.Controls.AddRange(@(
             $detailsGroup,
@@ -780,7 +963,36 @@ function Show-ContextMenuManagerGui {
         ))
 
     $state = @{
-        AllEntries = @()
+        AllEntries    = @()
+        ScopeViews    = @{}
+        BaseTabLabels = @{}
+    }
+
+    foreach ($tabDefinition in $tabDefinitions) {
+        $tabPage = New-Object System.Windows.Forms.TabPage
+        $tabPage.Tag = $tabDefinition.Id
+        $tabPage.Text = $tabDefinition.Label
+
+        $listView = New-Object System.Windows.Forms.ListView
+        $listView.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $listView.FullRowSelect = $true
+        $listView.HideSelection = $false
+        $listView.MultiSelect = $false
+        $listView.View = [System.Windows.Forms.View]::Details
+        $null = $listView.Columns.Add("Display Name", 210)
+        $null = $listView.Columns.Add("Scope", 120)
+        $null = $listView.Columns.Add("Source", 80)
+        $null = $listView.Columns.Add("Status", 80)
+        $null = $listView.Columns.Add("Key Name", 190)
+
+        $tabPage.Controls.Add($listView)
+        $null = $scopeTabControl.TabPages.Add($tabPage)
+
+        $state.ScopeViews[$tabDefinition.Id] = [pscustomobject]@{
+            TabPage  = $tabPage
+            ListView = $listView
+        }
+        $state.BaseTabLabels[$tabDefinition.Id] = $tabDefinition.Label
     }
 
     function Show-Message {
@@ -819,12 +1031,76 @@ function Show-ContextMenuManagerGui {
         $removeButton.Enabled = $false
     }
 
-    function Get-SelectedEntry {
-        if ($entryListView.SelectedItems.Count -eq 0) {
+    function Get-ActiveScopeId {
+        if ($null -eq $scopeTabControl.SelectedTab) {
+            return "All"
+        }
+
+        return [string]$scopeTabControl.SelectedTab.Tag
+    }
+
+    function Get-ListViewForScope {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$ScopeId
+        )
+
+        if (-not $state.ScopeViews.ContainsKey($ScopeId)) {
             return $null
         }
 
-        return $entryListView.SelectedItems[0].Tag
+        return $state.ScopeViews[$ScopeId].ListView
+    }
+
+    function Get-ActiveListView {
+        $scopeId = Get-ActiveScopeId
+        return Get-ListViewForScope -ScopeId $scopeId
+    }
+
+    function Get-SelectedEntry {
+        $activeListView = Get-ActiveListView
+        if ($null -eq $activeListView -or $activeListView.SelectedItems.Count -eq 0) {
+            return $null
+        }
+
+        return $activeListView.SelectedItems[0].Tag
+    }
+
+    function Update-CountLabel {
+        $scopeId = Get-ActiveScopeId
+        $activeListView = Get-ActiveListView
+        $count = if ($null -eq $activeListView) { 0 } else { $activeListView.Items.Count }
+        $countLabel.Text = "{0} items in {1}" -f $count, $state.BaseTabLabels[$scopeId]
+    }
+
+    function Get-VisibleEntriesForScope {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$ScopeId,
+
+            [Parameter(Mandatory = $false)]
+            [string]$Filter
+        )
+
+        $entries =
+            if ($ScopeId -eq "All") {
+                $state.AllEntries
+            }
+            else {
+                @($state.AllEntries | Where-Object { $_.ScopeId -eq $ScopeId })
+            }
+
+        if ([string]::IsNullOrWhiteSpace($Filter)) {
+            return @($entries)
+        }
+
+        $comparison = [System.StringComparison]::OrdinalIgnoreCase
+        return @($entries | Where-Object {
+                $_.DisplayName.IndexOf($Filter, $comparison) -ge 0 -or
+                $_.KeyName.IndexOf($Filter, $comparison) -ge 0 -or
+                $_.Source.IndexOf($Filter, $comparison) -ge 0 -or
+                $_.Command.IndexOf($Filter, $comparison) -ge 0
+            })
     }
 
     function Update-EntryDetails {
@@ -855,53 +1131,82 @@ function Show-ContextMenuManagerGui {
         )
 
         $filter = $filterTextBox.Text.Trim()
-        $comparison = [System.StringComparison]::OrdinalIgnoreCase
+        foreach ($tabDefinition in $tabDefinitions) {
+            $scopeId = $tabDefinition.Id
+            $scopeView = $state.ScopeViews[$scopeId]
+            $listView = $scopeView.ListView
+            $visibleEntries = Get-VisibleEntriesForScope -ScopeId $scopeId -Filter $filter
 
-        $visibleEntries =
-            if ([string]::IsNullOrWhiteSpace($filter)) {
-                $state.AllEntries
+            $listView.BeginUpdate()
+            $listView.Items.Clear()
+
+            foreach ($entry in $visibleEntries) {
+                $item = New-Object System.Windows.Forms.ListViewItem($entry.DisplayName)
+                $null = $item.SubItems.Add([string]$entry.Scope)
+                $null = $item.SubItems.Add([string]$entry.Source)
+                $null = $item.SubItems.Add([string]$entry.Status)
+                $null = $item.SubItems.Add([string]$entry.KeyName)
+                $item.Tag = $entry
+                $null = $listView.Items.Add($item)
             }
-            else {
-                @($state.AllEntries | Where-Object {
-                        $_.DisplayName.IndexOf($filter, $comparison) -ge 0 -or
-                        $_.KeyName.IndexOf($filter, $comparison) -ge 0 -or
-                        $_.Scope.IndexOf($filter, $comparison) -ge 0 -or
-                        $_.Source.IndexOf($filter, $comparison) -ge 0 -or
-                        $_.Command.IndexOf($filter, $comparison) -ge 0
-                    })
-            }
 
-        $entryListView.BeginUpdate()
-        $entryListView.Items.Clear()
-
-        foreach ($entry in $visibleEntries) {
-            $item = New-Object System.Windows.Forms.ListViewItem($entry.DisplayName)
-            $null = $item.SubItems.Add([string]$entry.Scope)
-            $null = $item.SubItems.Add([string]$entry.Source)
-            $null = $item.SubItems.Add([string]$entry.Status)
-            $null = $item.SubItems.Add([string]$entry.KeyName)
-            $item.Tag = $entry
-            $null = $entryListView.Items.Add($item)
+            $listView.EndUpdate()
+            $scopeView.TabPage.Text = "{0} ({1})" -f $state.BaseTabLabels[$scopeId], $visibleEntries.Count
         }
 
-        $entryListView.EndUpdate()
-        $countLabel.Text = "{0} items" -f $visibleEntries.Count
-
+        $targetScopeId = Get-ActiveScopeId
         if (-not [string]::IsNullOrWhiteSpace($SelectedPath)) {
-            foreach ($item in $entryListView.Items) {
-                if ($item.Tag.RegistryPath -eq $SelectedPath) {
-                    $item.Selected = $true
-                    $item.Focused = $true
-                    $item.EnsureVisible()
-                    break
+            $currentListView = Get-ListViewForScope -ScopeId $targetScopeId
+            $selectionExistsInCurrentTab = $false
+
+            if ($null -ne $currentListView) {
+                foreach ($item in $currentListView.Items) {
+                    if ($item.Tag.RegistryPath -eq $SelectedPath) {
+                        $selectionExistsInCurrentTab = $true
+                        break
+                    }
+                }
+            }
+
+            if (-not $selectionExistsInCurrentTab) {
+                $targetEntry = $state.AllEntries | Where-Object { $_.RegistryPath -eq $SelectedPath } | Select-Object -First 1
+                if ($null -ne $targetEntry) {
+                    $targetScopeId = [string]$targetEntry.ScopeId
                 }
             }
         }
 
-        if ($entryListView.SelectedItems.Count -eq 0 -and $entryListView.Items.Count -gt 0) {
-            $entryListView.Items[0].Selected = $true
+        if (-not $state.ScopeViews.ContainsKey($targetScopeId)) {
+            $targetScopeId = "All"
         }
 
+        $scopeTabControl.SelectedTab = $state.ScopeViews[$targetScopeId].TabPage
+
+        $activeListView = Get-ActiveListView
+        if ($null -ne $activeListView) {
+            $selectedItem = $null
+
+            if (-not [string]::IsNullOrWhiteSpace($SelectedPath)) {
+                foreach ($item in $activeListView.Items) {
+                    if ($item.Tag.RegistryPath -eq $SelectedPath) {
+                        $selectedItem = $item
+                        break
+                    }
+                }
+            }
+
+            if ($null -eq $selectedItem -and $activeListView.Items.Count -gt 0) {
+                $selectedItem = $activeListView.Items[0]
+            }
+
+            if ($null -ne $selectedItem) {
+                $selectedItem.Selected = $true
+                $selectedItem.Focused = $true
+                $selectedItem.EnsureVisible()
+            }
+        }
+
+        Update-CountLabel
         Update-EntryDetails
     }
 
@@ -935,7 +1240,20 @@ function Show-ContextMenuManagerGui {
         return $selectedScopeIds
     }
 
-    $entryListView.Add_SelectedIndexChanged({
+    foreach ($tabDefinition in $tabDefinitions) {
+        (Get-ListViewForScope -ScopeId $tabDefinition.Id).Add_SelectedIndexChanged({
+                Update-EntryDetails
+            })
+    }
+
+    $scopeTabControl.Add_SelectedIndexChanged({
+            $activeListView = Get-ActiveListView
+            if ($null -ne $activeListView -and $activeListView.SelectedItems.Count -eq 0 -and $activeListView.Items.Count -gt 0) {
+                $activeListView.Items[0].Selected = $true
+                $activeListView.Items[0].Focused = $true
+            }
+
+            Update-CountLabel
             Update-EntryDetails
         })
 
@@ -1044,8 +1362,14 @@ function Show-ContextMenuManagerGui {
 }
 
 $normalizedAction = if ([string]::IsNullOrWhiteSpace($Action)) { "" } else { $Action.Trim().ToUpperInvariant() }
+$launchesGui = $Gui -or ([string]::IsNullOrWhiteSpace($normalizedAction) -and [string]::IsNullOrWhiteSpace($AppPath))
 
-if ($Gui -or ([string]::IsNullOrWhiteSpace($normalizedAction) -and [string]::IsNullOrWhiteSpace($AppPath))) {
+if (-not (Ensure-AdministratorSession -BoundParameters $PSBoundParameters -HideWindow:$launchesGui)) {
+    return
+}
+
+if ($launchesGui) {
+    Set-ConsoleWindowVisibility -Visible $false
     Show-ContextMenuManagerGui
     return
 }
